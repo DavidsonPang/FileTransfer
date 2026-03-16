@@ -1,15 +1,18 @@
 """
-基于 WebRTC 的文件发送端
-支持 NAT 穿透和直接 P2P 传输
+WebRTC P2P file sender.
+Supports NAT traversal and direct peer-to-peer transfer.
 """
+
 import asyncio
-import os
 import json
+import os
 import sys
-from aiortc import RTCPeerConnection, RTCConfiguration, RTCIceServer
+
+from aiortc import RTCConfiguration, RTCIceServer, RTCPeerConnection
 from tqdm import tqdm
 import qrcode
-from core.utils import get_file_hash, format_size, compress_sdp, decompress_sdp
+
+from core.utils import compress_sdp, decompress_sdp, format_size, get_file_hash
 
 
 class FileSender:
@@ -19,190 +22,233 @@ class FileSender:
         self.channel = None
         self.file_size = os.path.getsize(file_path)
         self.file_name = os.path.basename(file_path)
-        self.chunk_size = 64000  # WebRTC DataChannel 推荐大小
+        self.chunk_size = 64000  # Recommended DataChannel chunk size.
+        self.file_hash = None
+        self.resume_offset = 0
+        self.resume_event = asyncio.Event()
+        self.transfer_started = False
 
     async def create_offer(self):
-        """创建 Offer 并等待 ICE 收集完成"""
-        # 配置 STUN 服务器（使用 Google 的免费服务）
-        config = RTCConfiguration([
-            RTCIceServer(urls=["stun:stun.l.google.com:19302"]),
-            RTCIceServer(urls=["stun:stun1.l.google.com:19302"]),
-        ])
+        """Create offer and wait for ICE gathering to complete."""
+        config = RTCConfiguration(
+            [
+                RTCIceServer(urls=["stun:stun.l.google.com:19302"]),
+                RTCIceServer(urls=["stun:stun1.l.google.com:19302"]),
+            ]
+        )
 
         self.pc = RTCPeerConnection(configuration=config)
 
-        # 创建数据通道（可靠传输模式）
+        # Reliable data channel.
         self.channel = self.pc.createDataChannel("file_transfer")
 
-        # 设置数据通道事件
         @self.channel.on("open")
         async def on_open():
-            print(f"✓ 连接已建立，开始传输...")
+            print("Connection established, start transfer.")
             await self.send_file()
 
         @self.channel.on("close")
         def on_close():
-            print("连接已关闭")
+            print("Connection closed.")
 
         @self.channel.on("error")
         def on_error(error):
-            print(f"✗ 传输错误: {error}")
+            print(f"Transfer error: {error}")
 
-        # 监听连接状态
+        @self.channel.on("message")
+        def on_message(message):
+            if isinstance(message, str):
+                self._handle_control_message(message)
+
         @self.pc.on("connectionstatechange")
         async def on_connectionstatechange():
-            print(f"连接状态: {self.pc.connectionState}")
+            print(f"Connection state: {self.pc.connectionState}")
             if self.pc.connectionState == "failed":
-                print("✗ 连接失败，可能是 NAT 穿透失败")
-                print("建议使用 ZeroTier 或 Tailscale 创建虚拟局域网")
+                print("Connection failed, NAT traversal might have failed.")
+                print("Try using ZeroTier or Tailscale for virtual LAN testing.")
                 await self.pc.close()
 
-        # 创建 Offer
         offer = await self.pc.createOffer()
         await self.pc.setLocalDescription(offer)
 
-        # 等待 ICE 收集完成（重要！）
-        print("正在收集网络信息...")
+        print("Gathering network info...")
         await self._wait_for_ice_gathering()
 
-        # 生成包含完整 ICE candidates 的 SDP
-        offer_dict = {
+        return {
             "type": self.pc.localDescription.type,
-            "sdp": self.pc.localDescription.sdp
+            "sdp": self.pc.localDescription.sdp,
         }
 
-        return offer_dict
+    def _handle_control_message(self, message):
+        try:
+            data = json.loads(message)
+        except Exception:
+            return
+
+        if data.get("type") != "RESUME":
+            return
+
+        if self.transfer_started:
+            return
+
+        expected_name = data.get("name")
+        expected_size = data.get("size")
+        expected_hash = data.get("hash")
+        offset = data.get("offset", 0)
+
+        if (
+            expected_name != self.file_name
+            or expected_size != self.file_size
+            or expected_hash != self.file_hash
+        ):
+            self.resume_offset = 0
+            self.resume_event.set()
+            return
+
+        if not isinstance(offset, int) or offset < 0 or offset > self.file_size:
+            self.resume_offset = 0
+            self.resume_event.set()
+            return
+
+        self.resume_offset = offset
+        self.resume_event.set()
 
     async def _wait_for_ice_gathering(self):
-        """等待 ICE 收集完成"""
-        # 等待 ICE gathering 状态变为 complete
+        """Wait for ICE gathering completion."""
         while self.pc.iceGatheringState != "complete":
             await asyncio.sleep(0.1)
-        print("✓ 网络信息收集完成")
+        print("Network info ready.")
 
     async def set_answer(self, answer_dict):
-        """设置 Answer"""
+        """Set remote answer."""
         from aiortc import RTCSessionDescription
-        answer = RTCSessionDescription(
-            sdp=answer_dict["sdp"],
-            type=answer_dict["type"]
-        )
+
+        answer = RTCSessionDescription(sdp=answer_dict["sdp"], type=answer_dict["type"])
         await self.pc.setRemoteDescription(answer)
-        print("✓ 已接收对方响应，等待连接建立...")
+        print("Answer received, waiting for data channel to open...")
 
     async def send_file(self):
-        """发送文件"""
+        """Send file over data channel."""
         try:
-            # 计算文件哈希
-            print(f"正在计算文件校验和...")
-            file_hash = get_file_hash(self.file_path)
+            print("Calculating file hash...")
+            self.file_hash = get_file_hash(self.file_path)
 
-            # 发送文件元数据
             metadata = {
                 "name": self.file_name,
                 "size": self.file_size,
-                "hash": file_hash,
-                "algorithm": "sha256"
+                "hash": self.file_hash,
+                "algorithm": "sha256",
             }
             self.channel.send(json.dumps(metadata))
-            print(f"\n文件名: {self.file_name}")
-            print(f"大小: {format_size(self.file_size)}")
-            print(f"SHA256: {file_hash}\n")
 
-            # 等待接收端确认
-            await asyncio.sleep(0.5)
+            print(f"\nFile: {self.file_name}")
+            print(f"Size: {format_size(self.file_size)}")
+            print(f"SHA256: {self.file_hash}\n")
 
-            # 发送文件数据
-            with open(self.file_path, 'rb') as f:
-                with tqdm(total=self.file_size, unit='B', unit_scale=True, desc="发送进度") as pbar:
+            # Wait for optional RESUME request from receiver.
+            try:
+                await asyncio.wait_for(self.resume_event.wait(), timeout=5.0)
+            except asyncio.TimeoutError:
+                pass
+
+            with open(self.file_path, "rb") as file_obj:
+                if self.resume_offset >= self.file_size:
+                    self.transfer_started = True
+                    self.channel.send(json.dumps({"type": "EOF"}))
+                    print("\nFile already complete on receiver, no resend needed.")
+                    return
+
+                if self.resume_offset > 0:
+                    file_obj.seek(self.resume_offset)
+                    print(f"Resume from {format_size(self.resume_offset)}")
+
+                self.transfer_started = True
+                with tqdm(
+                    total=self.file_size,
+                    initial=self.resume_offset,
+                    unit="B",
+                    unit_scale=True,
+                    desc="Sending",
+                ) as pbar:
                     while True:
-                        chunk = f.read(self.chunk_size)
+                        chunk = file_obj.read(self.chunk_size)
                         if not chunk:
                             break
 
-                        # 发送数据块
                         self.channel.send(chunk)
                         pbar.update(len(chunk))
 
-                        # 简单的流控：等待缓冲区不要太满
+                        # Basic backpressure control.
                         while self.channel.bufferedAmount > self.chunk_size * 4:
                             await asyncio.sleep(0.01)
 
-            # 发送结束标记
             self.channel.send(json.dumps({"type": "EOF"}))
-            print("\n✓ 文件传输完成！")
+            print("\nTransfer complete.")
 
-        except Exception as e:
-            print(f"\n✗ 传输失败: {e}")
+        except Exception as exc:
+            print(f"\nTransfer failed: {exc}")
             raise
 
     async def close(self):
-        """关闭连接"""
+        """Close peer connection."""
         if self.pc:
             await self.pc.close()
 
 
 async def main():
     if len(sys.argv) < 2:
-        print("用法: python sender.py <文件路径>")
+        print("Usage: python sender.py <file_path>")
         sys.exit(1)
 
     file_path = sys.argv[1]
 
     if not os.path.exists(file_path):
-        print(f"✗ 文件不存在: {file_path}")
+        print(f"File does not exist: {file_path}")
         sys.exit(1)
 
     if os.path.isdir(file_path):
-        print("✗ 暂不支持文件夹传输，请先打包成 zip")
+        print("Directory transfer is not supported. Pack it as zip first.")
         sys.exit(1)
 
     sender = FileSender(file_path)
 
     try:
-        # 创建 Offer
         offer_dict = await sender.create_offer()
-
-        # 压缩并显示 Offer
         compressed_offer = compress_sdp(offer_dict)
 
-        print("\n" + "="*60)
-        print("请将以下信息发送给接收端（可以通过微信、QQ 等方式）")
-        print("="*60)
+        print("\n" + "=" * 60)
+        print("Send this offer string to the receiver.")
+        print("=" * 60)
         print(compressed_offer)
-        print("="*60)
+        print("=" * 60)
 
-        # 生成二维码（可选）
         try:
             qr = qrcode.QRCode(version=1, box_size=3, border=2)
             qr.add_data(compressed_offer)
             qr.make(fit=True)
-            print("\n或者扫描以下二维码:")
+            print("\nOr let receiver scan this QR:")
             qr.print_ascii(invert=True)
-        except (ImportError, Exception) as e:
-            # 二维码生成失败不影响主要功能
+        except (ImportError, Exception):
             pass
 
-        print("\n")
-
-        # 等待接收端的 Answer
-        compressed_answer = input("请输入接收端返回的信息: ").strip()
+        print()
+        compressed_answer = input("Paste answer from receiver: ").strip()
 
         try:
             answer_dict = decompress_sdp(compressed_answer)
             await sender.set_answer(answer_dict)
-        except Exception as e:
-            print(f"✗ 解析响应失败: {e}")
+        except Exception as exc:
+            print(f"Failed to parse answer: {exc}")
             sys.exit(1)
 
-        # 等待传输完成（使用事件机制会更好，这里简化处理）
-        await asyncio.sleep(3600)  # 最多等待1小时
+        await asyncio.sleep(3600)
 
     except KeyboardInterrupt:
-        print("\n\n用户取消传输")
-    except Exception as e:
-        print(f"\n✗ 发生错误: {e}")
+        print("\n\nTransfer cancelled by user.")
+    except Exception as exc:
+        print(f"\nUnexpected error: {exc}")
         import traceback
+
         traceback.print_exc()
     finally:
         await sender.close()
